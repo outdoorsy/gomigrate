@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 type migrationType string
@@ -18,6 +19,7 @@ const (
 	migrationTableName = "gomigrate"
 	upMigration        = migrationType("up")
 	downMigration      = migrationType("down")
+	noTransactionComment = "-- NO TX"
 )
 
 var (
@@ -222,11 +224,73 @@ func (m *Migrator) ApplyMigration(migration *Migration, mType migrationType) err
 
 	m.logger.Printf("Applying migration: %s", path)
 
-	sql, err := ioutil.ReadFile(path)
+	sqlBytes, err := ioutil.ReadFile(path)
 	if err != nil {
 		m.logger.Printf("Error reading migration: %s", path)
 		return err
 	}
+
+	sqlStr := string(sqlBytes)
+
+	if strings.HasPrefix(sqlStr,noTransactionComment){
+		sqlStr = strings.TrimPrefix(sqlStr,noTransactionComment)
+		return m.doMigrationWithoutTransaction(migration,mType,sqlStr)
+	} else {
+		return m.doMigrationWithTransaction(migration,mType,sqlStr)
+	}
+}
+
+func (m *Migrator) doMigrationWithoutTransaction(migration *Migration, mType migrationType, sql string) error {
+	// Certain adapters can not handle multiple sql commands in one file so we need the adapter to split up the command
+	commands := m.dbAdapter.GetMigrationCommands(sql)
+
+	// Perform the migration.
+	for _, cmd := range commands {
+		result, err := m.DB.Exec(cmd)
+		if err != nil {
+			m.logger.Printf("Error executing migration: %v", err)
+			return err
+		}
+		if result != nil {
+			if rowsAffected, err := result.RowsAffected(); err != nil {
+				m.logger.Printf("Error getting rows affected: %v", err)
+				return err
+			} else {
+				m.logger.Printf("Rows affected: %v", rowsAffected)
+			}
+		}
+	}
+
+	var err error
+
+	// Log the event.
+	if mType == upMigration {
+		_, err = m.DB.Exec(
+			m.dbAdapter.MigrationLogInsertSql(),
+			migration.Id,
+		)
+	} else {
+		_, err = m.DB.Exec(
+			m.dbAdapter.MigrationLogDeleteSql(),
+			migration.Id,
+		)
+	}
+	if err != nil {
+		m.logger.Printf("Error logging migration! This is super bad because this wasn't run in a transaction cause you said not to. It must be fixed manually: %v", err)
+		return err
+	}
+
+
+	if mType == upMigration {
+		migration.Status = Active
+	} else {
+		migration.Status = Inactive
+	}
+
+	return nil
+}
+
+func (m *Migrator) doMigrationWithTransaction(migration *Migration, mType migrationType, sql string) error {
 	transaction, err := m.DB.Begin()
 	if err != nil {
 		m.logger.Printf("Error opening transaction: %v", err)
@@ -234,7 +298,7 @@ func (m *Migrator) ApplyMigration(migration *Migration, mType migrationType) err
 	}
 
 	// Certain adapters can not handle multiple sql commands in one file so we need the adapter to split up the command
-	commands := m.dbAdapter.GetMigrationCommands(string(sql))
+	commands := m.dbAdapter.GetMigrationCommands(sql)
 
 	// Perform the migration.
 	for _, cmd := range commands {
